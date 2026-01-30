@@ -6,7 +6,7 @@ class HTTPServer {
     private let tools: Tools
     private let port: UInt16
     private var listener: NWListener?
-    private var connections: [UUID: ClientConnection] = [:]
+    private var sessions: [String: ClientConnection] = [:]
     private let queue = DispatchQueue(label: "httpserver", qos: .userInitiated)
 
     init(tools: Tools, port: UInt16) {
@@ -20,16 +20,14 @@ class HTTPServer {
 
         listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
 
-        listener?.stateUpdateHandler = { [weak self] state in
+        listener?.stateUpdateHandler = { state in
             switch state {
             case .ready:
-                if let port = self?.listener?.port {
-                    FileHandle.standardError.write("Things MCP server listening on http://0.0.0.0:\(port.rawValue)\n".data(using: .utf8)!)
-                    FileHandle.standardError.write("SSE endpoint: http://0.0.0.0:\(port.rawValue)/sse\n".data(using: .utf8)!)
-                    FileHandle.standardError.write("Message endpoint: POST http://0.0.0.0:\(port.rawValue)/message?sessionId=<id>\n".data(using: .utf8)!)
-                }
+                Logger.shared.info("Server listening on port \(self.port)")
             case .failed(let error):
-                FileHandle.standardError.write("Server failed: \(error)\n".data(using: .utf8)!)
+                Logger.shared.error("Server failed: \(error)")
+            case .cancelled:
+                Logger.shared.info("Server stopped")
             default:
                 break
             }
@@ -49,19 +47,29 @@ class HTTPServer {
 
     private func handleConnection(_ connection: NWConnection) {
         let clientId = UUID()
-        let client = ClientConnection(id: clientId, connection: connection, tools: tools)
+        let client = ClientConnection(id: clientId, connection: connection, tools: tools, server: self)
 
-        queue.async { [weak self] in
-            self?.connections[clientId] = client
-        }
-
-        client.onClose = { [weak self] in
+        client.onClose = { [weak self] sessionId in
             self?.queue.async {
-                self?.connections.removeValue(forKey: clientId)
+                if let sessionId = sessionId {
+                    self?.sessions.removeValue(forKey: sessionId)
+                }
             }
         }
 
         client.start()
+    }
+
+    func registerSession(_ sessionId: String, client: ClientConnection) {
+        queue.async {
+            self.sessions[sessionId] = client
+        }
+    }
+
+    func sendToSession(_ sessionId: String, event: String, data: String) {
+        queue.async {
+            self.sessions[sessionId]?.sendSSEEvent(event: event, data: data)
+        }
     }
 }
 
@@ -70,16 +78,18 @@ class ClientConnection {
     let id: UUID
     let connection: NWConnection
     let tools: Tools
-    var onClose: (() -> Void)?
+    weak var server: HTTPServer?
+    var onClose: ((String?) -> Void)?
 
     private var sseSessionId: String?
     private var isSSE = false
     private var buffer = Data()
 
-    init(id: UUID, connection: NWConnection, tools: Tools) {
+    init(id: UUID, connection: NWConnection, tools: Tools, server: HTTPServer) {
         self.id = id
         self.connection = connection
         self.tools = tools
+        self.server = server
     }
 
     func start() {
@@ -87,8 +97,14 @@ class ClientConnection {
             switch state {
             case .ready:
                 self?.receiveData()
-            case .failed, .cancelled:
-                self?.onClose?()
+            case .failed(let error):
+                Logger.shared.debug("Connection failed: \(error)")
+                self?.onClose?(self?.sseSessionId)
+            case .cancelled:
+                if let sessionId = self?.sseSessionId {
+                    Logger.shared.info("SSE session disconnected: \(sessionId)")
+                }
+                self?.onClose?(self?.sseSessionId)
             default:
                 break
             }
@@ -104,8 +120,10 @@ class ClientConnection {
             }
 
             if isComplete || error != nil {
-                self?.connection.cancel()
-                self?.onClose?()
+                if !(self?.isSSE ?? false) {
+                    self?.connection.cancel()
+                    self?.onClose?(self?.sseSessionId)
+                }
             } else {
                 self?.receiveData()
             }
@@ -119,6 +137,8 @@ class ClientConnection {
             handleSSE(request)
         } else if request.path.hasPrefix("/message") && request.method == "POST" {
             handleMessage(request)
+        } else if request.path.hasPrefix("/message") && request.method == "OPTIONS" {
+            handleOptions(request)
         } else if request.path == "/" || request.path == "/health" {
             handleHealth(request)
         } else {
@@ -193,59 +213,81 @@ class ClientConnection {
         isSSE = true
         sseSessionId = UUID().uuidString
 
-        let headers = """
-        HTTP/1.1 200 OK\r
-        Content-Type: text/event-stream\r
-        Cache-Control: no-cache\r
-        Connection: keep-alive\r
-        Access-Control-Allow-Origin: *\r
-        Access-Control-Allow-Headers: Content-Type\r
-        \r
+        Logger.shared.info("SSE connection established, session: \(sseSessionId!)")
 
-        """
+        var headers = "HTTP/1.1 200 OK\r\n"
+        headers += "Content-Type: text/event-stream\r\n"
+        headers += "Cache-Control: no-cache\r\n"
+        headers += "Connection: keep-alive\r\n"
+        headers += "Access-Control-Allow-Origin: *\r\n"
+        headers += "Access-Control-Allow-Headers: Content-Type\r\n"
+        headers += "\r\n"
 
         connection.send(content: headers.data(using: .utf8), completion: .contentProcessed { [weak self] _ in
-            // Send endpoint event with session ID
             guard let self = self, let sessionId = self.sseSessionId else { return }
+
+            // Register this session with the server
+            self.server?.registerSession(sessionId, client: self)
+
+            // Send endpoint event with session ID
             let endpointEvent = "event: endpoint\ndata: /message?sessionId=\(sessionId)\n\n"
             self.connection.send(content: endpointEvent.data(using: .utf8), completion: .contentProcessed { _ in })
         })
     }
 
+    private func handleOptions(_ request: HTTPRequest) {
+        var response = "HTTP/1.1 204 No Content\r\n"
+        response += "Access-Control-Allow-Origin: *\r\n"
+        response += "Access-Control-Allow-Methods: POST, OPTIONS\r\n"
+        response += "Access-Control-Allow-Headers: Content-Type\r\n"
+        response += "Access-Control-Max-Age: 86400\r\n"
+        response += "\r\n"
+
+        connection.send(content: response.data(using: .utf8), completion: .contentProcessed { [weak self] _ in
+            self?.connection.cancel()
+        })
+    }
+
     private func handleMessage(_ request: HTTPRequest) {
         guard let sessionId = request.queryParams["sessionId"] else {
+            Logger.shared.warning("Message received without sessionId")
             sendHTTPResponse(status: 400, body: "{\"error\": \"Missing sessionId\"}")
             return
         }
 
         guard let body = request.body,
               let bodyString = String(data: body, encoding: .utf8) else {
+            Logger.shared.warning("Message received without body")
             sendHTTPResponse(status: 400, body: "{\"error\": \"Missing body\"}")
             return
         }
 
+        Logger.shared.debug("Request: \(bodyString)")
+
         // Process the JSON-RPC request
         let response = processJSONRPC(bodyString)
 
-        // Send response with CORS headers
-        let responseHeaders = """
-        HTTP/1.1 202 Accepted\r
-        Content-Type: application/json\r
-        Access-Control-Allow-Origin: *\r
-        Access-Control-Allow-Headers: Content-Type\r
-        Content-Length: \(response.utf8.count)\r
-        \r
+        Logger.shared.debug("Response: \(response)")
 
-        """
-        connection.send(content: (responseHeaders + response).data(using: .utf8), completion: .contentProcessed { [weak self] _ in
+        // Send 202 Accepted immediately
+        var responseHeaders = "HTTP/1.1 202 Accepted\r\n"
+        responseHeaders += "Content-Type: text/plain\r\n"
+        responseHeaders += "Access-Control-Allow-Origin: *\r\n"
+        responseHeaders += "Access-Control-Allow-Headers: Content-Type\r\n"
+        responseHeaders += "Content-Length: 8\r\n"
+        responseHeaders += "\r\n"
+        responseHeaders += "Accepted"
+
+        connection.send(content: responseHeaders.data(using: .utf8), completion: .contentProcessed { [weak self] _ in
             self?.connection.cancel()
         })
 
-        // Also send response via SSE to any connected clients with this session
-        // In a full implementation, you'd maintain a session registry
+        // Send the actual response via SSE to the session
+        server?.sendToSession(sessionId, event: "message", data: response)
     }
 
     private func handleHealth(_ request: HTTPRequest) {
+        Logger.shared.debug("Health check")
         let body = "{\"status\": \"ok\", \"server\": \"things-mcp\", \"version\": \"1.0.0\"}"
         sendHTTPResponse(status: 200, body: body, contentType: "application/json")
     }
@@ -268,6 +310,8 @@ class ClientConnection {
     }
 
     private func processRequest(_ request: JSONRPCRequest) -> JSONRPCResponse {
+        Logger.shared.info("Method: \(request.method)")
+
         switch request.method {
         case "initialize":
             return handleInitialize(request)
@@ -276,10 +320,15 @@ class ClientConnection {
         case "tools/list":
             return handleToolsList(request)
         case "tools/call":
+            if let params = request.params?.objectValue,
+               let toolName = params["name"]?.stringValue {
+                Logger.shared.info("Tool call: \(toolName)")
+            }
             return handleToolsCall(request)
         case "ping":
             return JSONRPCResponse(id: request.id, result: .object([:]))
         default:
+            Logger.shared.warning("Unknown method: \(request.method)")
             return JSONRPCResponse(id: request.id, error: .methodNotFound)
         }
     }
@@ -341,16 +390,14 @@ class ClientConnection {
         default: statusText = "Unknown"
         }
 
-        let response = """
-        HTTP/1.1 \(status) \(statusText)\r
-        Content-Type: \(contentType)\r
-        Content-Length: \(body.utf8.count)\r
-        Access-Control-Allow-Origin: *\r
-        Access-Control-Allow-Headers: Content-Type\r
-        Connection: close\r
-        \r
-        \(body)
-        """
+        var response = "HTTP/1.1 \(status) \(statusText)\r\n"
+        response += "Content-Type: \(contentType)\r\n"
+        response += "Content-Length: \(body.utf8.count)\r\n"
+        response += "Access-Control-Allow-Origin: *\r\n"
+        response += "Access-Control-Allow-Headers: Content-Type\r\n"
+        response += "Connection: close\r\n"
+        response += "\r\n"
+        response += body
 
         connection.send(content: response.data(using: .utf8), completion: .contentProcessed { [weak self] _ in
             self?.connection.cancel()

@@ -5,6 +5,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var httpServer: HTTPServer?
     private var isRunning = false
     private var settingsWindowController: SettingsWindowController?
+    private var logsWindowController: LogsWindowController?
 
     private var currentPort: UInt16 {
         return Settings.shared.port
@@ -65,6 +66,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Settings
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ","))
 
+        // Logs
+        menu.addItem(NSMenuItem(title: "View Logs...", action: #selector(openLogs), keyEquivalent: "l"))
+
         menu.addItem(NSMenuItem.separator())
 
         // Quit
@@ -75,6 +79,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func startServer() {
         guard !isRunning else { return }
+
+        Logger.shared.info("Starting server on port \(currentPort)...")
 
         let authToken = Settings.shared.authToken
         let thingsClient = ThingsClient(authToken: authToken.isEmpty ? nil : authToken)
@@ -88,11 +94,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             updateStatusIcon()
             updateMenu()
         } catch {
+            Logger.shared.error("Failed to start server: \(error.localizedDescription)")
             showError("Failed to start server: \(error.localizedDescription)")
         }
     }
 
     @objc private func stopServer() {
+        Logger.shared.info("Stopping server...")
         httpServer = nil
         isRunning = false
         updateStatusIcon()
@@ -127,6 +135,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         settingsWindowController?.showWindow(nil)
         settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func openLogs() {
+        NSApp.activate(ignoringOtherApps: true)
+        if logsWindowController == nil {
+            logsWindowController = LogsWindowController()
+        }
+        logsWindowController?.showWindow()
     }
 
     @objc private func quit() {
