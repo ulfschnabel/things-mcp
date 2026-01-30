@@ -2,6 +2,8 @@
 
 A native Swift MCP (Model Context Protocol) server for the [Things](https://culturedcode.com/things/) task manager on macOS. Allows AI assistants like Claude to create, update, and manage todos and projects in Things.
 
+> **Note:** This project was vibe-coded with [Claude Code](https://claude.ai/claude-code) (Claude Opus 4.5).
+
 ## Features
 
 - **Native Swift implementation** - Fast, lightweight, no dependencies
